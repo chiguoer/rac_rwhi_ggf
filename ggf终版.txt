@@ -1,0 +1,341 @@
+**GGF：Gaussian Geometry-Guided Fusion**
+
+---
+
+## 1. 模块定位与总体思路
+
+GGF 的目标是：
+在 RaCFormer 这样的 **Query-based 雷达–相机融合 Transformer** 中，引入一个**由雷达构造的几何先验**，显式引导多模态 Cross-Attention 的行为，回答两个问题：
+
+* 雷达认为：**场景中哪里真的有“物理实体”**（车辆、行人、静态基础设施等）？
+* 给定这些几何信息：**每个查询在融合视觉特征时，应该更信任哪些位置/哪些区域？**
+
+为此，GGF 做三件事：
+
+1. 把稀疏雷达点编码为一组 3D **高斯原语**，形成一个连续的**雷达几何场**；
+2. 在 BEV 平面上对高斯进行双流泼溅：
+
+   * 一条生成雷达 BEV **语义特征图** (F_{\text{sem}})；
+   * 一条生成雷达 BEV **几何置信图（标量场）** (M_{\text{conf}})；
+3. 在 Transformer 解码器中，对于每一个 Query：
+
+   * 先在 (M_{\text{conf}}) 上**采样得到一个标量置信度** (g_q)；
+   * 再用这个标量对该 Query 的视觉特征输出进行**重加权调制**，从而实现几何先验对跨模态注意力的引导。
+
+整个链路可以概括为：
+
+> 雷达点 → 高斯几何场 → BEV 几何标量场 (M_{\text{conf}}) → Query 采样得到 (g_q) → 调制视觉特征 (\hat{\boldsymbol{z}}_q^{vis})。
+
+下面分模块展开。
+
+---
+
+## 2. 子模块一：雷达高斯几何场编码（Radar Gaussian Geometry Field Encoder）
+
+### 2.1 输入与输出定义
+
+**输入：** 单帧或多帧融合后的雷达点云
+[
+P_{radar} = {p_i}*{i=1}^N,\quad
+p_i = (x_i, y_i, z_i, v*{r,i}, \mathrm{RCS}_i, f_i^{raw}),
+]
+其中：
+
+* ((x_i,y_i,z_i))：雷达测得的 3D 坐标（车体坐标系）；
+* (v_{r,i})：径向速度（多普勒）；
+* (\mathrm{RCS}_i)：雷达截面积；
+* (f_i^{raw})：由一个简单 MLP 对上述物理量编码得到的初始点特征（维度 (C_{raw})）。
+
+**输出：** 一组高斯原语
+[
+\mathcal{G} = {g_i}_{i=1}^N,\quad
+g_i = {\mu_i, \Sigma_i, f_i^{g}},
+]
+其中：
+
+* (\mu_i \in \mathbb{R}^3)：高斯中心，**直接取雷达点坐标** ((x_i, y_i, z_i))，不预测，保证物理对齐；
+* (\Sigma_i \in \mathbb{R}^{3\times 3})：协方差矩阵，用于描述该雷达原语在 3D 空间的形状和不确定度；
+* (f_i^{g} \in \mathbb{R}^{C_g})：该高斯的语义特征向量。
+
+### 2.2 网络结构（LFA + GFA + 多头预测）
+
+可以整体参考 PGE 的范式：
+
+1. **局部特征聚合（LFA）**
+
+   * 在 3D 空间中，为每个点 (p_i) 搜索邻域点集 (\mathcal{N}(i))（例如球邻域或 KNN）；
+   * 对每个邻居 (p_j)，构建局部关系向量：
+     [
+     \delta_{ij} = [x_j-x_i,; y_j-y_i,; z_j-z_i,; v_{r,j}-v_{r,i},; \mathrm{RCS}_j-\mathrm{RCS}_i],
+     ]
+   * 用一个共享 MLP 对 ([f_j^{raw}, \delta_{ij}]) 编码后聚合（max/avg pooling），得到局部特征 (f_i^{loc})。
+
+2. **全局特征聚合（GFA）**
+
+   * 把所有点的 ([f_i^{raw}, f_i^{loc}]) 作为输入，做一层轻量 self-attention 或 Transformer block，得到全局增强后的特征 (f_i^{glob})。
+
+3. **高斯属性预测头**
+
+   以 ([f_i^{raw}, f_i^{loc}, f_i^{glob}]) 为输入，通过三路 MLP 预测不同属性：
+
+   * 形状分支：
+     [
+     s_i = \mathrm{MLP}_s(\cdot) \in \mathbb{R}^3,\quad \text{对数尺度或直接尺度}
+     ]
+   * 旋转分支（可选）：
+     [
+     q_i = \mathrm{MLP}_q(\cdot) \in \mathbb{R}^4,\quad \text{归一化为单位四元数}
+     ]
+   * 语义分支：
+     [
+     f_i^{g} = \mathrm{MLP}_f(\cdot) \in \mathbb{R}^{C_g}
+     ]
+
+4. **协方差构造**
+
+   * 由四元数 (q_i) 转成旋转矩阵 (R_i \in \mathbb{R}^{3\times 3})；
+   * 由 (s_i) 构造对角矩阵 (\mathrm{diag}(s_i^2))；
+   * 得到协方差：
+     [
+     \Sigma_i = R_i \cdot \mathrm{diag}(s_i^2) \cdot R_i^\top.
+     ]
+
+> 关键约束：**不预测中心 (\mu_i)，只在形状/方向/特征上建模。** 这样高斯原语始终锚定在实际雷达测量位置，避免在稀疏场景中出现不合理漂移。
+
+---
+
+## 3. 子模块二：双流 BEV 高斯泼溅（Dual-Stream BEV Gaussian Splatting）
+
+目标：将 3D 高斯原语投影到 BEV 平面，得到：
+
+* 雷达 BEV **语义特征图** (F_{\text{sem}})（用于 BEV 分支，多通道）；
+* 雷达 BEV **几何置信图** (M_{\text{conf}})（标量场，只保留几何强度）。
+
+### 3.1 3D 高斯 → BEV 2D 高斯
+
+设 BEV 范围为 ([x_{\min}, x_{\max}] \times [y_{\min}, y_{\max}])，分辨率为 (H_{\text{bev}} \times W_{\text{bev}})。
+
+对于每个高斯 (g_i)：
+
+1. **中心投影到 BEV：**
+   [
+   \mu_{i,bev} = (x_i, y_i)
+   ]
+
+2. **协方差投影到 BEV 平面：**
+   使用投影矩阵
+   [
+   P =
+   \begin{bmatrix}
+   1 & 0 & 0\
+   0 & 1 & 0
+   \end{bmatrix},
+   \quad
+   \Sigma_{i,bev} = P \Sigma_i P^\top \in \mathbb{R}^{2\times 2}.
+   ]
+
+3. **构造 2D 高斯核：**
+   对于 BEV 网格中的某个 cell ((u,v))，其物理坐标为 (\xi_{uv}=(x_{uv},y_{uv}))，对应的核值：
+   [
+   w_i(u,v) = \exp\Big(
+   -\frac{1}{2}
+   (\xi_{uv}-\mu_{i,bev})^\top
+   \Sigma_{i,bev}^{-1}
+   (\xi_{uv}-\mu_{i,bev})
+   \Big).
+   ]
+
+在实现中，为加速可对每个高斯限制一个有限支撑（例如 3σ 矩形区域），只在局部栅格上计算 (w_i(u,v))。
+
+### 3.2 语义流：Semantic BEV Feature Map (F_{\text{sem}})
+
+语义流聚合所有高斯的语义向量 (f_i^{g})，得到每个 BEV cell 的语义特征：
+
+[
+F_{\text{sem}}(u,v)
+===================
+
+\frac{1}{Z_{uv}}
+\sum_{i} w_i(u,v), f_i^{g},
+\quad
+Z_{uv} = \sum_i w_i(u,v) + \varepsilon.
+]
+
+* 输出形状：(\mathbb{R}^{C_g \times H_{\text{bev}} \times W_{\text{bev}}})。
+* 功能：作为**雷达 BEV 语义特征图**，可直接输入到 RaCFormer 的 BEV 分支，替代原来的 pillar-based radar BEV encoder 输出。
+
+### 3.3 几何流：Geometric Confidence Map (M_{\text{conf}})
+
+几何流只关心“是否有实体”及其空间形状，不携带语义：
+
+[
+M_{\text{conf}}(u,v) = \sum_i w_i(u,v).
+]
+
+* 输出形状：(\mathbb{R}^{1 \times H_{\text{bev}} \times W_{\text{bev}}})。
+* 可选归一化：
+
+  * min-max 归一：
+    [
+    M_{\text{conf}} \leftarrow \frac{M_{\text{conf}} - m_{\min}}{m_{\max}-m_{\min} + \varepsilon}
+    ]
+  * 或 log-scaling、标准化等。
+
+**物理含义：**
+
+* (M_{\text{conf}}(u,v)) 越大，说明该 BEV cell 区域内叠加了越多高斯质量（考虑协方差），雷达越“确信”这里存在物理结构；
+* 高速运动的目标，由于协方差形状的拉伸，会在 BEV 上形成带有方向性的“高斯斑”，体现运动轨迹。
+
+**至此，雷达高斯几何场在 BEV 上被转换为一个可微分、可插值的标量场 (M_{\text{conf}})。**
+
+---
+
+## 4. 子模块三：Query 级几何引导注意力（Query-wise Geometry-Guided Attention）
+
+这一部分是 GGF 真正影响多模态融合的位置，也是最终需要在 Transformer 中实现的逻辑。
+
+核心思想：
+
+* 把 (M_{\text{conf}}) 当作一个定义在 BEV 平面上的**几何置信标量场**；
+* 对每个 Query，用其 BEV 参考点在该标量场上采样一个值 (g_q)；
+* 用这个标量对 Query 的视觉特征输出做**重加权调制**，在不破坏 Deformable Attention 内部结构的前提下，引入雷达几何先验。
+
+### 4.1 Query 的 BEV 参考点
+
+在 RaCFormer + RWHI 体系中，每个解码器 Query (q) 都携带一个 BEV 参考点：
+
+[
+\boldsymbol{r}_q = (x_q, y_q), \quad q = 1,\dots,N_q.
+]
+
+* 初始时由 RWHI 从统一概率场中 Top-K 采样得到（或者由 baseline 的初始化方案生成）；
+* 随着 decoder 层的迭代，可按 RaCFormer 的做法更新 reference（例如通过 FFN 预测偏移）。
+
+### 4.2 Step A：在几何标量场 (M_{\text{conf}}) 上采样
+
+将物理坐标 ((x_q, y_q)) 映射到 BEV 网格坐标 ((u_q, v_q))，然后做双线性插值：
+
+[
+g_q = \mathrm{BilinearSample}\big(M_{\text{conf}}, u_q, v_q\big).
+]
+
+此时：
+
+* (M_{\text{conf}}: \mathbb{R}^{H_{\text{bev}}\times W_{\text{bev}}} \to \mathbb{R}) 是一个**二维标量场**；
+* (g_q \in \mathbb{R}) 是一个**标量**，表示当前 Query 所在位置的“雷达几何置信度”。
+
+为了数值稳定和可学习性，我们通常对 (g_q) 做一个归一化和缩放：
+
+[
+\tilde{g}_q = \sigma\big(\gamma \cdot (g_q - \mu_g)\big),
+]
+
+其中：
+
+* (\mu_g)：可以是 (M_{\text{conf}}) 的全局均值（常数），也可以是一个可学习的偏置；
+* (\gamma)：可学习的尺度因子（标量）；
+* (\sigma(\cdot))：Sigmoid 函数，使 (\tilde{g}_q \in (0,1))。
+
+(\tilde{g}_q) 可以理解为**几何可信度的标准化版本**，后续直接参与 gating。
+
+### 4.3 Step B：对视觉分支的 Deformable Attention 输出做特征调制
+
+RaCFormer 的视觉分支对于每个 Query，都通过多相机的 Deformable Attention 聚合视觉特征：
+
+[
+\boldsymbol{z}*q^{vis}
+= \mathrm{DeformAttn}\big(
+\boldsymbol{q}*q,;
+{\boldsymbol{F}*c}*{c=1}^C,;
+{\boldsymbol{r}*{q,c}}*{c=1}^C
+\big)
+\in \mathbb{R}^{C},
+]
+
+其中 (\boldsymbol{F}*c) 是第 c 个相机的特征图，(\boldsymbol{r}*{q,c}) 是对应到各相机视角的参考点/采样偏移。
+
+**关键设计选择：**
+
+* 我们**不修改** Deformable Attention 内部关于偏移 (\Delta \boldsymbol{p})、采样位置、logit 计算的复杂结构——这一部分很敏感，一旦打乱容易导致训练难以收敛；
+* 我们只在其**输出向量** (\boldsymbol{z}_q^{vis}) 上做一个 Query-wise 的**特征重加权（Feature Re-weighting / Gating）**。
+
+具体地，定义：
+
+[
+\hat{\boldsymbol{z}}_q^{vis}
+= \big(1 + \beta \tilde{g}_q\big)\cdot \boldsymbol{z}_q^{vis},
+]
+
+其中：
+
+* (\boldsymbol{z}_q^{vis} \in \mathbb{R}^{C})：DeformAttn 的原始输出向量；
+* (\tilde{g}_q \in (0,1))：当前 Query 在几何场上的归一化置信度（标量）；
+* (\beta)：可学习的缩放系数（标量，初值可设为 1 或 0）；
+* “(\cdot)” 是标量–向量乘法（对所有通道统一缩放）。
+
+解释：
+
+* 当 (\tilde{g}_q) 较大（雷达几何强支撑），((1+\beta \tilde{g}_q)) > 1：增强该 Query 从视觉分支获得的信号，模型更信任图像语义；
+* 当 (\tilde{g}_q) 较小（雷达几何证据不足），((1+\beta \tilde{g}_q)) 约等于 1 或略小：减弱视觉信号的影响，避免在没有物理支撑的位置被纯视觉噪声/幻觉误导。
+
+这个操作在数学类型上非常清晰：
+
+> 标量场 (M_{\text{conf}}) → 标量 (g_q) → 标量 ((1+\beta \tilde{g}_q)) → 乘向量 (\boldsymbol{z}_q^{vis})。
+
+同时，它也是一种在多模态融合中被广泛使用的**特征重加权策略**，具备良好的稳定性和可解释性。
+
+### 4.4 对 BEV 分支的可选调制
+
+如果解码器同时也对 BEV 特征（融合后的 BEV map）做 Cross-Attention，可以类似地用 (\tilde{g}_q) 对 BEV 输出做调制：
+
+[
+\hat{\boldsymbol{z}}*q^{bev}
+= \big(1 + \beta*{\text{bev}} \tilde{g}_q\big)\cdot \boldsymbol{z}_q^{bev}.
+]
+
+是否开启这一路可以根据实验和复杂度决定。主创新点在于对**视觉分支的 Query 级几何引导**即可。
+
+---
+
+## 5. 与 PGE / RaCFormer 的关系与实现落点
+
+最后，从“落到代码 / 论文实现”的角度，明确一下 GGF 与原始模块的关系。
+
+### 5.1 与原始 PGE 的关系
+
+* 相同点：
+
+  * 都使用“雷达点 → 高斯原语 → 高斯泼溅”的基本范式；
+* 不同点（关键创新）：
+
+  1. **任务语境不同**：PGE 用于雷达单模态 3D 检测，你的 GGF 用于雷达–相机多模态融合；
+  2. **表示形态不同**：
+
+     * PGE 输出一张单流 BEV 特征图；
+     * GGF 明确拆出语义流 (F_{\text{sem}}) 和几何标量流 (M_{\text{conf}})，后者专门用作几何先验；
+  3. **使用方式不同**：
+
+     * PGE 把 BEV 特征喂给 backbone/检测头，不直接干预注意力；
+     * GGF 将 (M_{\text{conf}}) 经过 Query 采样转为 (g_q)，再通过 gating 显式控制 Query 的注意力行为，是对 Transformer 结构本身的**归纳偏置注入**。
+
+### 5.2 与 RaCFormer 的接口
+
+* **替换雷达 BEV 编码器：**
+
+  * 原 RaCFormer：pillar-based Radar BEV encoder；
+  * 现在：使用 GGF 的高斯编码 + 语义流，输出 (F_{\text{sem}}) 作为新的 Radar BEV 特征。
+
+* **扩展解码器的 Query 更新：**
+
+  * 原 RaCFormer：DeformAttn 后直接进入后续层；
+  * 现在：在 DeformAttn 输出后，加一行 Query-wise 几何调制：
+    [
+    \hat{\boldsymbol{z}}_q^{vis}
+    = (1+\beta \tilde{g}_q)\cdot \boldsymbol{z}_q^{vis}.
+    ]
+  * 其中 (\tilde{g}*q) 由 Query 的 BEV 参考点在 (M*{\text{conf}}) 上采样得到。
+
+* **与 RWHI 的配合（为之后整体论文铺垫）：**
+
+  * RWHI 决定的是 Query 的 BEV 参考点 (\boldsymbol{r}_q) 如何初始化（以及全局分布）；
+  * GGF 利用**同一个 (\boldsymbol{r}_q)** 在几何场中查询几何置信度，实现初始化与融合机制之间的自然耦合。
