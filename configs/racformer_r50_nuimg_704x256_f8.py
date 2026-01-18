@@ -2,8 +2,8 @@ import torch
 pi = torch.pi
 
 dataset_type = 'CustomNuScenesDataset_radar'
-#dataset_root = 'data/nuscenes/'
-dataset_root = '/data/dataset/RacFormer/nuscenes/'
+dataset_root = 'data/nuscenes/'
+#dataset_root = '/data/dataset/RacFormer/nuscenes/'
 
 input_modality = dict(
     use_lidar=False,
